@@ -766,6 +766,7 @@ pub unsafe fn on_create(list: *mut c_void, alloc: usize, pso: usize, ty: D3D12_C
 
 /// Clean up all tracked state when a command list is released for good.
 pub(super) fn on_release(list: usize) {
+    super::alloc_pool::forget_list(list);
     super::title_textures::list_reset(list);
     let old = LISTS.lock().unwrap().as_mut().and_then(|m| m.remove(&list));
     if let Some(old) = old {
@@ -2293,8 +2294,9 @@ unsafe fn try_split_for_wait(list: *mut c_void) -> Option<*mut c_void> {
     let mut next_pc: Option<*mut c_void> = None;
     if let Some(spare) = super::title_list::pop_spare(wrapper) {
         let ext_spare = *(spare as *const usize);
-        let pc_alloc = super::alloc_pool::for_list(spare as usize, alloc, ty.0);
-        let reset_hr = pc::<unsafe extern "system" fn(*mut c_void, usize, usize) -> i32>(spare, PC_RESET)(spare, pc_alloc, init_pso);
+        let reset_hr = super::alloc_pool::reset_list(spare as usize, alloc, ty.0, |pc_alloc| {
+            pc::<unsafe extern "system" fn(*mut c_void, usize, usize) -> i32>(spare, PC_RESET)(spare, pc_alloc, init_pso)
+        });
         real::preserve_vtable(spare, ext_spare);
         if reset_hr >= 0 {
             next_pc = Some(spare);
@@ -2833,8 +2835,9 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
 
     let ext_closed = *(target as *const usize);
     let init_pso = super::pso_async::resolve_for_bind(bound_pso);
-    let pc_alloc = super::alloc_pool::for_list(target as usize, alloc, list_type(target).0);
-    let reset_hr = pc::<unsafe extern "system" fn(*mut c_void, usize, usize) -> i32>(target, PC_RESET)(target, pc_alloc, init_pso);
+    let reset_hr = super::alloc_pool::reset_list(target as usize, alloc, list_type(target).0, |pc_alloc| {
+        pc::<unsafe extern "system" fn(*mut c_void, usize, usize) -> i32>(target, PC_RESET)(target, pc_alloc, init_pso)
+    });
     real::preserve_vtable(target, ext_closed);
     if reset_hr < 0 {
         return warn(&ERR, "KickoffX", format_args!("Reset after kickoff failed ({reset_hr:#x})"));
@@ -3064,7 +3067,16 @@ unsafe fn gpu_va(list: *mut c_void, va: u64, bytes: usize, what: &str, mirror: b
         return t;
     }
     // in a window by number: a PC resource's GPU address
-    if crate::gpu::uma::get().is_none_or(|u| u.contains(va as usize)) || !crate::gpu::shader::readable(va as usize, bytes) {
+    if crate::gpu::uma::get().is_none_or(|u| u.contains(va as usize)) {
+        return t;
+    }
+    // a buffer bound before has its mirror: no `readable` (a `VirtualQuery` walk of the title's
+    // memory when it is not resident – most of a retail title's render thread at a bind per
+    // draw); `sync_title_buffers` checks what it reads
+    if let Some(p) = mirror.then(|| mirrored(va, bytes)).flatten() {
+        return pc_va(p as u64);
+    }
+    if !crate::gpu::shader::readable(va as usize, bytes) {
         return t;
     }
     if mirror {
@@ -3374,8 +3386,9 @@ pub unsafe extern "system" fn reset_x(this: *mut c_void, alloc: usize, pso: usiz
     let resolved = super::pso_async::resolve_for_bind(pso);
     // (the PC allocator the title's allocator stands for now: `alloc_pool`)
     let ty = LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(this as usize))).and_then(|s| s.list_type).map_or(-1, |t| t.0);
-    let pc_alloc = super::alloc_pool::for_list(this as usize, alloc, ty);
-    let hr = pc::<unsafe extern "system" fn(*mut c_void, usize, usize) -> i32>(this, PC_RESET)(this, pc_alloc, resolved);
+    let hr = super::alloc_pool::reset_list(this as usize, alloc, ty, |pc_alloc| {
+        pc::<unsafe extern "system" fn(*mut c_void, usize, usize) -> i32>(this, PC_RESET)(this, pc_alloc, resolved)
+    });
     real::preserve_vtable(this, ext);
     if hr < 0 {
         return hr;
@@ -3877,7 +3890,7 @@ mod tests {
         let list = object.as_mut_ptr() as *mut c_void;
         let key = list as usize;
 
-        unsafe { on_create(list, 0x100, 0, D3D12_COMMAND_LIST_TYPE_DIRECT) };
+        unsafe { on_create(list, 0x111, 0, D3D12_COMMAND_LIST_TYPE_DIRECT) };
         {
             let mut g = LISTS.lock().unwrap();
             let s = g.as_mut().unwrap().get_mut(&key).unwrap();
@@ -3900,6 +3913,7 @@ mod tests {
 
         RESET_TEST_HR.store(0x8000_4005, Ordering::SeqCst);
         assert!(unsafe { reset_x(list, 0x333, 0x555) } < 0);
+        let failed_backing = super::super::alloc_pool::recording_backing_for_test(key);
         assert_eq!(object[0], ext);
         {
             let g = LISTS.lock().unwrap();
@@ -3920,6 +3934,7 @@ mod tests {
 
         RESET_TEST_HR.store(0, Ordering::SeqCst);
         assert_eq!(unsafe { reset_x(list, 0x333, 0x555) }, 0);
+        let successful_backing = super::super::alloc_pool::recording_backing_for_test(key);
         assert_eq!(object[0], ext);
         {
             let g = LISTS.lock().unwrap();
@@ -3936,6 +3951,12 @@ mod tests {
 
         LISTS.lock().unwrap().as_mut().unwrap().remove(&key);
         super::super::bind::remove_state_for_test(list);
+        unsafe {
+            super::super::alloc_pool::forget(0x111);
+            super::super::alloc_pool::forget(0x333);
+        }
+        assert_eq!(failed_backing, Some(0x111), "failed Reset must keep holding the old recording's allocator");
+        assert_eq!(successful_backing, Some(0x333), "only successful Reset moves the recording to its new allocator");
     }
 
     #[test]
@@ -5816,6 +5837,37 @@ mod tests {
                 gr.cells.remove(&va_b);
                 gr.cells.remove(&va_c);
             }
+        }
+    }
+
+    /// A buffer outside unified memory that has a mirror is bound at its mirror again without
+    /// asking whether the title's memory is readable: the source made unreadable after the first
+    /// bind still binds the same mirror (before, the bind asked `readable` first and gave the
+    /// title's address back, which the PC's GPU has no address for).
+    #[test]
+    fn a_mirrored_buffer_binds_its_mirror_without_asking_readable() {
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualProtect, MEM_COMMIT, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE};
+        if crate::gpu::uma::get().is_none() {
+            crate::gpu::recomp::runner::skip_test("no unified memory");
+            return;
+        }
+        unsafe {
+            let len = 0x1_0000usize;
+            let src = VirtualAlloc(std::ptr::null(), len, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) as *mut u8;
+            assert!(!src.is_null());
+            for k in 0..len {
+                *src.add(k) = k as u8;
+            }
+            let (va, bytes) = (src as u64 + 0x100, 0x400usize);
+            let first = gpu_va(std::ptr::null_mut(), va, bytes, "test vertex buffer", true);
+            assert_ne!(first, va, "the first bind makes a mirror");
+            assert!(mirrored(va, bytes).is_some());
+            let mut old = 0u32;
+            assert_ne!(VirtualProtect(src as *const _, len, PAGE_NOACCESS, &mut old), 0);
+            assert!(!crate::gpu::shader::readable(va as usize, bytes));
+            assert_eq!(gpu_va(std::ptr::null_mut(), va, bytes, "test vertex buffer", true), first);
+            // the range stays reserved (and unreadable): the mirror table is never emptied, so its
+            // address must not come back for another test's memory
         }
     }
 }
