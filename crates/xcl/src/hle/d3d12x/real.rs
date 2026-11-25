@@ -274,11 +274,19 @@ unsafe fn check_uma_import(device: &ID3D12Device, u: &crate::gpu::uma::Uma, bufs
         readback.Unmap(0, None);
         Ok(got)
     };
-    let got = run();
+    let got = match run() {
+        Ok(got) => got,
+        Err(e) => {
+            // The copy may still be running: what it uses stays (a few KiB, once). Released under
+            // the GPU, vkd3d-proton frees it at once and the GPU faults (RADV: page faults, then a
+            // ring timeout) – a slow first use of the imported window is enough to get here.
+            std::mem::forget((queue, alloc, list, fence, readback));
+            return Err(e);
+        }
+    };
     for &(_, _, p, _) in &probes {
         u.free(p);
     }
-    let got = got?;
     let wrong: Vec<String> =
         probes.iter().filter(|&&(_, i, _, c)| got[i] != c).map(|&(k, i, _, c)| format!("window {k}: wrote {c:#x}, the GPU read {:#x}", got[i])).collect();
     if !wrong.is_empty() {
@@ -3395,6 +3403,13 @@ fn with_switch_fallback<R>(mut build: impl FnMut() -> R) -> R {
     if !HEAP_WINDOW_OOM.with(|o| o.replace(false)) {
         return r;
     }
+    if crate::gpu::uma::get().is_some_and(|u| u.shader_windows() > crate::gpu::uma::MAX_WINDOWS) {
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            crate::xlog_warn!("D3D12.X: the driver refused an expanded-window pipeline; switch-form retry requires XCL_UMA_WINDOWS=4");
+        });
+        return r;
+    }
     let n = SWITCH_FORM_RETRIES.fetch_add(1, Ordering::Relaxed);
     if n < 5 || n % 100 == 0 {
         crate::xlog_warn!("D3D12.X: the driver ran out of memory on a pipeline with heap windows – building it in the switch form ({} so far)", n + 1);
@@ -3598,7 +3613,7 @@ fn pso_trace() -> bool {
 fn driver_compile_identified<R>(kind: &str, bytes: usize, gate: bool, record: Option<(u64, bool)>, build: impl FnOnce() -> R) -> (R, std::time::Duration) {
     let huge = gate && bytes >= huge_pso_bytes() && std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso"));
     let waited = std::time::Instant::now();
-    let slot = huge.then(|| big_compile_turn(compile_slots(bytes), big_compile_commit_free, super::pso_async::build_is_wanted)).flatten();
+    let slot = huge.then(|| big_compile_turn(compile_slots(bytes), || big_compile_commit_free(big_compile_headroom(bytes)), super::pso_async::build_is_wanted)).flatten();
     let waited = waited.elapsed();
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
     let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1;
@@ -3635,12 +3650,12 @@ fn gate_compute_driver_compile(has_cached_blob: bool) -> bool {
 }
 
 /// Before a big driver compile in the background: its turn – at most the configured number at
-/// once, and 3 GB of commit
-/// free (each takes ~1.5 GB; the title loading next to it must not run out). Unless one of the
-/// title's threads waits for the pipeline (`wanted`): then at once and without a slot (None), as
-/// when that thread builds it itself. Holding such a build back holds the title back: on a
-/// machine with less than 3 GB of commit free throughout a retail title's world loading, the
-/// first one would not go on and keeps the slot, until the title's watchdog ends it.
+/// once, and the commit headroom it asks for (`commit_free`, from `big_compile_headroom`; the
+/// title loading next to it must not run out). Unless one of the title's threads waits for the
+/// pipeline (`wanted`): then at once and without a slot (None), as when that thread builds it
+/// itself. Holding such a build back holds the title back: on a machine with less than the
+/// headroom free throughout a retail title's world loading, the first one would not go on and
+/// keeps the slot, until the title's watchdog ends it.
 fn big_compile_turn(slots: &'static Slots, commit_free: impl Fn() -> bool, wanted: impl Fn() -> bool) -> Option<SlotGuard> {
     const LOOK: std::time::Duration = std::time::Duration::from_millis(50);
     let slot = {
@@ -3666,12 +3681,21 @@ fn big_compile_turn(slots: &'static Slots, commit_free: impl Fn() -> bool, wante
     Some(slot)
 }
 
-/// 3 GB of commit are free (true when that is not known).
-fn big_compile_commit_free() -> bool {
+/// Commit headroom a big driver compile waits for: 3 GB for the class that starts at
+/// `huge_pso_bytes()` (each takes ~1.5 GB in the driver), and ~512× the DXIL size above 6 MiB
+/// of it — the driver's compile of a 29.8 MB program grew past 14 GB free before it was stopped
+/// (#1269), and programs of ~1 MB took several GB each on an 8 GB card (same issue). The floor
+/// leaves every program up to 6 MiB of DXIL waiting for exactly what it waited for before.
+fn big_compile_headroom(dxil_len: usize) -> u64 {
+    (3u64 << 30).max(dxil_len as u64 * 512)
+}
+
+/// That much commit is free (true when that is not known).
+fn big_compile_commit_free(need: u64) -> bool {
     use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
     let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
     m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
-    unsafe { GlobalMemoryStatusEx(&mut m) == 0 || m.ullAvailPageFile >= 3 << 30 }
+    unsafe { GlobalMemoryStatusEx(&mut m) == 0 || m.ullAvailPageFile >= need }
 }
 
 #[cfg(test)]
@@ -3786,6 +3810,17 @@ mod big_compile_tests {
     }
 
     #[test]
+    fn headroom_is_the_3_gb_floor_until_512_times_the_dxil_exceeds_it() {
+        // the class from huge_pso_bytes() up to 6 MiB of DXIL: the floor, unchanged
+        assert_eq!(big_compile_headroom(huge_pso_bytes()), 3 << 30);
+        assert_eq!(big_compile_headroom(6 << 20), 3 << 30);
+        // above it the wait scales with the program: the 29.8 MB one that grew past 14 GB of
+        // free commit (#1269) waits for 15 GB
+        assert_eq!(big_compile_headroom(8 << 20), 4 << 30);
+        assert_eq!(big_compile_headroom(29_800_000), 29_800_000u64 * 512);
+    }
+
+    #[test]
     fn unwanted_builds_go_one_at_a_time_when_the_commit_is_there() {
         static S: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 1 };
         let first = big_compile_turn(&S, || true, || false).expect("its turn");
@@ -3850,7 +3885,7 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
     if let Some(b) = &cached {
         copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE { pCachedBlob: b.as_ptr() as *const c_void, CachedBlobSizeInBytes: b.len() };
     }
-    // in the background, a few at a time and within the commit left (each ~1.5 GB in the driver)
+    // in the background, a few at a time and within the commit headroom the program asks for
     let record = crate::gpu::shader::fnv64(cs);
     let (mut hr, mut in_driver) = driver_compile_identified(
         "compute",
@@ -3886,6 +3921,20 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
         driver_cache::note(true, None);
     }
     if hr < 0 {
+        // A huge program's verdict in the log itself: `note_translation_error` goes to the
+        // report, or to the notes of a cached-only attempt – a retail title's 13.8 MB program
+        // took an AMD driver 15 – 23 s and ~15 GB to refuse with E_OUTOFMEMORY in every run, and
+        // the log showed only its `driver compile finish` and the dispatches skipped after it.
+        if dxil.len() >= huge_pso_bytes() {
+            // (the record hash is the console program's, as in `driver compile start` and
+            // `xcl shaders --measure-pso`; the driver-cache name is the translated DXIL's)
+            crate::xlog_warn!(
+                "D3D12.X: the driver refused the compute PSO of record {record:016x} ({} B DXIL, driver cache {}) with {hr:#x} after {} ms in the driver: its dispatches are skipped",
+                dxil.len(),
+                driver_cache::name(&dxil, copy.Flags.0),
+                in_driver.as_millis()
+            );
+        }
         note_translation_error(format!("the driver rejected the compute PSO with the translated CS ({hr:#x})"));
         return Some(Err(()));
     }
@@ -4401,6 +4450,146 @@ mod graphics_blob_tests {
             assert_ne!(ka, graphics_blob_key(&b, b"vs", Some(b"ps"), None, &[]));
         }
     }
+
+    #[test]
+    fn stale_cached_graphics_blob_preserves_rect_list_gs_on_retry() {
+        const E_INVALIDARG: HRESULT = -2147024809;
+        let gs = [1u8; 16];
+        let blob = [0xABu8; 32];
+        let mut copy = D3D12_GRAPHICS_PIPELINE_STATE_DESC::default();
+        copy.GS = bytecode(&gs);
+        let mut stale_evicted = 0usize;
+        let mut attempts = Vec::new();
+        let build = create_graphics_pso_cached(
+            &mut copy,
+            Some(&blob),
+            true,
+            || stale_evicted += 1,
+            |label, has_cached, f| {
+                let hr = f();
+                attempts.push((label.to_string(), has_cached, hr));
+                (hr, std::time::Duration::from_millis(1))
+            },
+            |c| {
+                // Driver rejects the stale CachedPSO, and accepts the fresh compile with rect GS intact.
+                if !c.CachedPSO.pCachedBlob.is_null() {
+                    E_INVALIDARG
+                } else if !c.GS.pShaderBytecode.is_null() {
+                    0
+                } else {
+                    E_INVALIDARG
+                }
+            },
+        );
+        assert_eq!(build.hr, 0);
+        assert_eq!(stale_evicted, 1);
+        assert!(!build.reused);
+        assert!(build.cache_eligible, "fresh compile with rect GS intact should be cached");
+        assert!(!copy.GS.pShaderBytecode.is_null(), "stale cached blob must not strip rect GS");
+        assert!(copy.CachedPSO.pCachedBlob.is_null());
+        assert_eq!(attempts.len(), 2);
+        assert_eq!((attempts[0].0.as_str(), attempts[0].1, attempts[0].2), ("graphics", true, E_INVALIDARG));
+        assert_eq!((attempts[1].0.as_str(), attempts[1].1, attempts[1].2), ("graphics retry", false, 0));
+    }
+
+    #[test]
+    fn rect_list_gs_fallback_does_not_cache_under_with_gs_key() {
+        const E_INVALIDARG: HRESULT = -2147024809;
+        let gs = [2u8; 16];
+        let mut copy = D3D12_GRAPHICS_PIPELINE_STATE_DESC::default();
+        copy.GS = bytecode(&gs);
+        let mut calls = 0usize;
+        let build = create_graphics_pso_cached(
+            &mut copy,
+            None,
+            true,
+            || panic!("no cached blob to evict"),
+            |_, _, f| (f(), std::time::Duration::from_millis(1)),
+            |c| {
+                calls += 1;
+                if c.GS.pShaderBytecode.is_null() { 0 } else { E_INVALIDARG }
+            },
+        );
+        assert_eq!(build.hr, 0);
+        assert_eq!(calls, 2);
+        assert!(copy.GS.pShaderBytecode.is_null());
+        assert!(!build.reused);
+        assert!(!build.cache_eligible, "fallback no-GS PSO must not overwrite the with-GS cache key");
+    }
+
+    #[test]
+    fn valid_cached_graphics_blob_reuses_without_retry() {
+        let gs = [3u8; 16];
+        let blob = [0xCDu8; 32];
+        let mut copy = D3D12_GRAPHICS_PIPELINE_STATE_DESC::default();
+        copy.GS = bytecode(&gs);
+        let mut calls = 0usize;
+        let build = create_graphics_pso_cached(
+            &mut copy,
+            Some(&blob),
+            true,
+            || panic!("valid cached blob must not be evicted"),
+            |_, has_cached, f| {
+                assert!(has_cached);
+                (f(), std::time::Duration::from_millis(1))
+            },
+            |c| {
+                calls += 1;
+                assert!(!c.CachedPSO.pCachedBlob.is_null());
+                assert!(!c.GS.pShaderBytecode.is_null());
+                0
+            },
+        );
+        assert_eq!(build.hr, 0);
+        assert_eq!(calls, 1);
+        assert!(build.reused);
+        assert!(!build.cache_eligible);
+        assert!(!copy.GS.pShaderBytecode.is_null());
+    }
+}
+
+struct GraphicsPsoBuild {
+    hr: HRESULT,
+    in_driver: std::time::Duration,
+    reused: bool,
+    cache_eligible: bool,
+}
+
+fn create_graphics_pso_cached(
+    copy: &mut D3D12_GRAPHICS_PIPELINE_STATE_DESC,
+    cached: Option<&[u8]>,
+    rect_gs: bool,
+    mut on_stale_cache: impl FnMut(),
+    mut run: impl FnMut(&str, bool, &mut dyn FnMut() -> HRESULT) -> (HRESULT, std::time::Duration),
+    mut create: impl FnMut(&D3D12_GRAPHICS_PIPELINE_STATE_DESC) -> HRESULT,
+) -> GraphicsPsoBuild {
+    if let Some(b) = cached {
+        copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE { pCachedBlob: b.as_ptr() as *const c_void, CachedBlobSizeInBytes: b.len() };
+        // Do not strip `rect_gs` while a cached blob is still attached: a stale blob must be
+        // discarded first so the uncached retry compiles with `copy.GS` intact.
+        let (hr, in_driver) = run("graphics", true, &mut || create(copy));
+        if hr >= 0 {
+            return GraphicsPsoBuild { hr, in_driver, reused: true, cache_eligible: false };
+        }
+        on_stale_cache();
+        copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
+        let (retried, took) = run("graphics retry", false, &mut || retry_without_rect_gs(copy, rect_gs, &mut create));
+        let dropped_rect_gs = rect_gs && copy.GS.pShaderBytecode.is_null();
+        return GraphicsPsoBuild {
+            hr: retried,
+            in_driver: in_driver + took,
+            reused: false,
+            cache_eligible: retried >= 0 && !dropped_rect_gs,
+        };
+    }
+    let (hr, in_driver) = run("graphics", false, &mut || retry_without_rect_gs(copy, rect_gs, &mut create));
+    let dropped_rect_gs = rect_gs && copy.GS.pShaderBytecode.is_null();
+    GraphicsPsoBuild {
+        hr,
+        in_driver,
+        reused: false,
+        cache_eligible: hr >= 0 && !dropped_rect_gs,
+    }
 }
 
 unsafe fn translated_graphics_pso(this: *mut c_void, f: PsoFn, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> Option<HRESULT> {
@@ -4488,39 +4677,26 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
     if from_disk {
         cached = disk.as_deref().and_then(driver_cache::load).map(std::sync::Arc::new);
     }
-    if let Some(b) = &cached {
-        copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE { pCachedBlob: b.as_ptr() as *const c_void, CachedBlobSizeInBytes: b.len() };
-    }
-    let (mut hr, mut in_driver) = driver_compile_identified(
-        "graphics",
-        bytes,
-        gate_compute_driver_compile(cached.is_some()),
-        Some((ps_hash, cached.is_some())),
-        || retry_without_rect_gs(&mut copy, rect_gs.is_some(), |c| finish_pso(this, f, c as *const _ as *const c_void, riid, ppv)),
+    let build = create_graphics_pso_cached(
+        &mut copy,
+        cached.as_deref().map(Vec::as_slice),
+        rect_gs.is_some(),
+        || {
+            forget_graphics_blob(gkey);
+            if from_disk {
+                driver_cache::note(false, disk.as_deref());
+            }
+        },
+        |label, has_cached, f| driver_compile_identified(label, bytes, gate_compute_driver_compile(has_cached), Some((ps_hash, has_cached)), f),
+        |c| finish_pso(this, f, c as *const _ as *const c_void, riid, ppv),
     );
-    if hr < 0 && cached.is_some() {
-        forget_graphics_blob(gkey);
-        if from_disk {
-            driver_cache::note(false, disk.as_deref());
-        }
-        copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
-        let (retried, took) = driver_compile_identified(
-            "graphics retry",
-            bytes,
-            true,
-            Some((ps_hash, false)),
-            || retry_without_rect_gs(&mut copy, rect_gs.is_some(), |c| finish_pso(this, f, c as *const _ as *const c_void, riid, ppv)),
-        );
-        hr = retried;
-        in_driver += took;
-    }
-    let reused = hr >= 0 && cached.is_some() && copy.CachedPSO.CachedBlobSizeInBytes != 0;
-    if hr >= 0 && !reused {
+    let hr = build.hr;
+    if build.cache_eligible {
         keep_graphics_blob(gkey, *ppv, bytes);
         if let (Some(p), Some(b)) = (disk.as_deref(), graphics_blob(gkey)) {
-            driver_cache::keep(p, &b, in_driver);
+            driver_cache::keep(p, &b, build.in_driver);
         }
-    } else if reused && from_disk {
+    } else if build.reused && from_disk {
         driver_cache::note(true, None);
     }
     if hr < 0 {
@@ -4615,7 +4791,7 @@ unsafe impl Send for OwnedDesc {}
 
 /// A hash of a pipeline's shaders in their order (never 0): what `pso_async` knows a used
 /// pipeline by in the next run.
-fn shaders_key(blobs: &[Vec<u8>]) -> u64 {
+pub(crate) fn shaders_key(blobs: &[Vec<u8>]) -> u64 {
     let mut h = 0xcbf2_9ce4_8422_2325u64;
     for b in blobs {
         h = (h ^ crate::gpu::shader::fnv64(b)).wrapping_mul(0x0000_0100_0000_01b3);
@@ -5100,6 +5276,9 @@ fn passthrough_mesh_stream_accepts_a_triangle_driver_blob() {
     }
 }
 
+#[allow(dead_code)] // Consumed by the stacked driver-cache integration.
+mod two_pass_identity;
+
 /// The console PS of a two-pass pipeline (a PC PS passes as it is).
 /// The PS of a two-pass pipeline (DXIL, static samplers – a PC PS passes as it is).
 fn two_pass_ps(ps: Option<&[u8]>, split_wave64: bool) -> Result<(Option<Vec<u8>>, Vec<crate::gpu::recomp::pso::StaticSampler>), String> {
@@ -5122,7 +5301,7 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
     let bytes = stream.shader_bytes() + tp.cs.len();
     let gate = bytes >= huge_pso_bytes() && std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso"));
     let waited = std::time::Instant::now();
-    let _slot = gate.then(|| big_compile_turn(compile_slots(bytes), big_compile_commit_free, super::pso_async::build_is_wanted)).flatten();
+    let _slot = gate.then(|| big_compile_turn(compile_slots(bytes), || big_compile_commit_free(big_compile_headroom(bytes)), super::pso_async::build_is_wanted)).flatten();
     if gate {
         crate::xlog_info!("D3D12.X: two-pass {kind} PSO ({bytes} B DXIL) gated: {}, waited {} ms", _slot.is_some(), waited.elapsed().as_millis());
     }

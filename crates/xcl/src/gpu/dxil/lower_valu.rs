@@ -466,7 +466,7 @@ impl Lw {
                 } else {
                     x
                 };
-                let h = self.to_f16(x);
+                let h = self.to_f16_rounded(x);
                 if m.opsel >> 3 & 1 == 1 {
                     let l = self.andc(cur, 0xFFFF);
                     let hh = self.shlc(h, 16);
@@ -582,10 +582,7 @@ impl Lw {
                 let x = fs!(0);
                 fr!(self.frexp_mant(x))
             }
-            "v_frexp_exp_i32_f32" => {
-                let x = fs!(0);
-                self.frexp_exp(x)
-            }
+            "v_frexp_exp_i32_f32" => self.frexp_exp_f32(a, |lw| lw.fsrc(&m, 0, a)),
             "v_ldexp_f32" => {
                 let x = fs!(0);
                 fr!(self.ldexp_f(x, b))

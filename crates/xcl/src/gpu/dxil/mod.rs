@@ -13,6 +13,7 @@
 
 pub mod bitstream;
 pub mod cfg;
+mod compact;
 pub mod container;
 pub mod coverage;
 pub mod graphics;
@@ -35,6 +36,8 @@ pub mod shader;
 pub mod ssa;
 pub mod validate;
 
+#[cfg(test)]
+mod compact_tests;
 #[cfg(test)]
 mod core_tests;
 #[cfg(test)]
