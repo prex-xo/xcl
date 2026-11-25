@@ -117,7 +117,9 @@ pub fn reset_list(list: usize, alloc: usize, ty: i32, reset: impl FnOnce(usize) 
 }
 
 #[cfg(test)]
-pub(super) fn recording_backing_for_test(list: usize) -> Option<usize> {
+pub(super) use recording_backing as recording_backing_for_test;
+
+pub(super) fn recording_backing(list: usize) -> Option<usize> {
     STATE.lock().unwrap().as_ref()?.of_list.get(&list).copied()
 }
 
@@ -214,6 +216,15 @@ pub unsafe fn executed(queue: *mut c_void, lists: &[*mut c_void]) {
         let recording = s.recordings.get(&(l as usize)).copied().unwrap_or(0);
         s.last_submit.insert(l as usize, LastSubmit { queue: key, fence: fence.clone(), value, recording });
     }
+}
+
+/// Whether the GPU may still run a recording made on the title's allocator `alloc`.
+pub(super) unsafe fn allocator_in_flight(alloc: usize) -> bool {
+    let g = STATE.lock().unwrap();
+    let Some(s) = g.as_ref() else { return false };
+    let mine = s.cur.get(&alloc).into_iter().chain(s.aside.get(&alloc).into_iter().flatten()).chain([&alloc]);
+    let busy = mine.filter_map(|b| s.backings.get(b)).any(|b| b.marks.values().any(|(f, v)| f.GetCompletedValue() < *v));
+    busy
 }
 
 /// The title's allocator `alloc` is gone (its last Release): nothing of it stays here – a later

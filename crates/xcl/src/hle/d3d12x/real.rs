@@ -983,6 +983,8 @@ fn console_slots(kind: Kind) -> Vec<(usize, usize)> {
                 (17, l::copy_resource_x as usize),
                 (19, l::resolve_subresource_x as usize),
                 (51, l::clear_depth_stencil_x as usize),
+                (53, l::clear_uav_uint_x as usize),
+                (54, l::clear_uav_float_x as usize),
                 (108, l::resolve_subresource_region_x as usize),
                 (13, b::draw_indexed_instanced as usize),
                 (14, b::dispatch as usize),
@@ -1705,6 +1707,12 @@ unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
     n
 }
 
+/// A stand-in that is no driver object (`standin`) was released for good.
+pub(super) fn standin_released(pso: usize) {
+    forget_pso(pso);
+    super::pso_async::release(super::pso_async::released(pso));
+}
+
 /// A stand-in pipeline released for good takes its background-built real pipeline with it.
 unsafe extern "system" fn pso_release(this: *mut c_void) -> u32 {
     let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
@@ -1816,6 +1824,8 @@ pub(super) fn forget_pso_for_test(pso: usize) {
 }
 
 fn forget_pso(pso: usize) {
+    super::dred::forget_pso(pso);
+    dispatch_chain::forget(pso);
     if let Some(s) = TRANSLATED_COMPUTE.lock().unwrap().as_mut() {
         s.remove(&pso);
     }
@@ -2797,7 +2807,10 @@ unsafe extern "system" fn dev_create_committed_resource_x(this: *mut c_void, pro
         .then(|| super::device_x::pc_resource_desc_for_device(this, &(console_desc as *const [u8; 0x38]).read_unaligned()));
     let desc = pc_full.as_ref().map_or(desc, |d| d.as_ptr() as usize);
     let mut clear_buf = [0u8; 24];
-    let clear = super::device_x::pc_clear(clear as *const c_void, &mut clear_buf) as usize;
+    let clear = match pc_full.as_ref() {
+        Some(d) => super::device_x::pc_clear_for_desc(clear as *const c_void, u32::from_le_bytes(d[0x20..0x24].try_into().unwrap()), &mut clear_buf),
+        None => super::device_x::pc_clear(clear as *const c_void, &mut clear_buf),
+    } as usize;
     // console-only state bits (e.g. 0x100000 on a display target) are not the PC's; a resource
     // the PC description took ALLOW_UNORDERED_ACCESS from does not start as a UAV
     let st = pc_full.as_ref().map_or(state as u32 & PC_RESOURCE_STATES, |d| {
@@ -2879,6 +2892,7 @@ fn overrides(kind: Kind) -> Vec<(&'static str, usize)> {
             ("DrawInstanced", cl_draw_instanced as usize),
             ("DrawIndexedInstanced", cl_draw_indexed_instanced as usize),
             ("SetPipelineState", cl_set_pipeline_state as usize),
+            ("SetMarker", cl_set_marker as usize),
             ("OMSetRenderTargets", cl_om_set_render_targets as usize),
             ("ClearRenderTargetView", cl_clear_rtv as usize),
             ("ExecuteIndirect", cl_execute_indirect as usize),
@@ -2973,6 +2987,10 @@ unsafe extern "system" fn cl_reset(this: *mut c_void, allocator: *mut c_void, in
     preserve_vtable(this, ext);
     if hr >= 0 {
         super::list_x::on_pc_reset(this);
+        super::dred::reset(this);
+        if !initial_state.is_null() {
+            super::dred::mark_pipeline(this, initial_state as usize, resolved as usize);
+        }
     }
     hr
 }
@@ -3099,13 +3117,27 @@ unsafe fn check_feature_support_pc(f: CheckFeatureSupportFn, this: *mut c_void, 
     hr2
 }
 
+thread_local! {
+    /// A `creator!` method is inside the runtime's own call: what it creates through the device
+    /// (D3D12Core's DRED breadcrumb buffers, made with the debug layer on) is the runtime's, not
+    /// the title's
+    static IN_CREATOR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// Device creation methods ending in (REFIID riid, void** ppv).
 macro_rules! creator {
     ($name:ident, $method:literal, $kind:expr, [$($a:ident),*]) => {
         pub(super) unsafe extern "system" fn $name(this: *mut c_void, $($a: usize,)* riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
             type F = unsafe extern "system" fn(*mut c_void, $(as_usize!($a),)* *const GUID, *mut *mut c_void) -> HRESULT;
             let f: F = std::mem::transmute(orig_fn(this, slot_of(this, $method)));
+            // the runtime calls the device's public methods from inside another one (a command
+            // list's DRED breadcrumb buffer, made through CreatePlacedResource): that object
+            // is still being made – asking it for interfaces to adopt it crashes D3D12Core
+            if IN_CREATOR.with(|c| c.replace(true)) {
+                return f(this, $($a,)* riid, ppv);
+            }
             let mut hr = f(this, $($a,)* riid, ppv);
+            IN_CREATOR.with(|c| c.set(false));
             if hr == E_NOINTERFACE {
                 let iid = pc_iid($kind);
                 hr = f(this, $($a,)* &iid, ppv);
@@ -3203,7 +3235,9 @@ pub(super) unsafe extern "system" fn dev_create_placed_resource_x(this: *mut c_v
     let x: [u8; 0x38] = (desc as *const [u8; 0x38]).read_unaligned();
     let d = super::device_x::pc_resource_desc(&x);
     let st = super::device_x::pc_initial_state(u32::from_le_bytes(x[0x30..0x34].try_into().unwrap()), state as u32);
-    let hr2 = dev_create_placed_resource(this, heap, offset, d.as_ptr() as usize, st as usize, clear, riid, ppv);
+    let mut clear_buf2 = [0u8; 24];
+    let clear_d = super::device_x::pc_clear_for_desc(clear as *const c_void, u32::from_le_bytes(d[0x20..0x24].try_into().unwrap()), &mut clear_buf2) as usize;
+    let hr2 = dev_create_placed_resource(this, heap, offset, d.as_ptr() as usize, st as usize, clear_d, riid, ppv);
     let heap_desc = pc_heap_desc(heap);
     let pc_size = pc_allocation_size(this, &d);
     // A texture the title placed by the console's size (`get_resource_allocation_info_x`
@@ -3212,7 +3246,7 @@ pub(super) unsafe extern "system" fn dev_create_placed_resource_x(this: *mut c_v
     // heap's kind; the console's aliasing of that one placement is lost.
     let is_texture = u32::from_le_bytes(x[0..4].try_into().unwrap()) != D3D12_RESOURCE_DIMENSION_BUFFER.0 as u32;
     let hr3 = match heap_desc {
-        Some(h) if hr2 < 0 && is_texture => Some(dev_create_committed_resource(this, &h.Properties as *const _ as usize, 0, d.as_ptr() as usize, st as usize, clear, riid, ppv)),
+        Some(h) if hr2 < 0 && is_texture => Some(dev_create_committed_resource(this, &h.Properties as *const _ as usize, 0, d.as_ptr() as usize, st as usize, clear_d, riid, ppv)),
         _ => None,
     };
     static N: AtomicU64 = AtomicU64::new(0);
@@ -3257,6 +3291,8 @@ unsafe fn own_memory_if_larger_on_the_pc(this: *mut c_void, heap: usize, offset:
     }
     let h = pc_heap_desc(heap)?;
     let st = super::device_x::pc_initial_state(u32::from_le_bytes(x[0x30..0x34].try_into().unwrap()), state as u32);
+    let mut clear_buf = [0u8; 24];
+    let clear = super::device_x::pc_clear_for_desc(clear as *const c_void, u32::from_le_bytes(d[0x20..0x24].try_into().unwrap()), &mut clear_buf) as usize;
     let mut hr = dev_create_committed_resource(this, &h.Properties as *const _ as usize, 0, d.as_ptr() as usize, st as usize, clear, riid, ppv);
     if hr < 0 && st != 0 {
         // as in the past-the-end fallback: a state the PC refuses for this desc (e.g. UAV
@@ -4305,18 +4341,74 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
     if big && crate::gpu::recomp::dxc::defer() {
         return Some(Err(()));
     }
+    let record = crate::gpu::shader::fnv64(cs);
+    if let Some(plan) = compiled.dispatch_chain {
+        if let Some(rs) = dispatch_chain::build(this, f, d, riid, ppv, record, &dxil, &compiled.samplers, plan) {
+            LAST_COMPUTE_RS.with(|c| c.set(rs));
+            note_pso_rs(*ppv, rs as *mut c_void);
+            super::dred::label(*ppv as usize, &[("cs", Some(cs))]);
+            if let Some(n) = crate::gpu::recomp::pso::compute_user_sgprs(cs) {
+                PSO_USER_SGPRS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, n);
+            }
+            note_translated_compute(0, ppv);
+            TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
+            return Some(Ok(0));
+        }
+    }
     let Some(rs) = abi_rs_for(this, &compiled.samplers) else { return Some(Err(())) };
     LAST_COMPUTE_RS.with(|c| c.set(rs as usize));
+    let (hr, in_driver, reused) = compute_container(this, f, d, rs, &dxil, record, riid, ppv, false);
+    if hr < 0 {
+        // A huge program's verdict in the log itself: `note_translation_error` goes to the
+        // report, or to the notes of a cached-only attempt – a retail title's 13.8 MB program
+        // took an AMD driver 15 – 23 s and ~15 GB to refuse with E_OUTOFMEMORY in every run, and
+        // the log showed only its `driver compile finish` and the dispatches skipped after it.
+        if dxil.len() >= huge_pso_bytes() {
+            // (the record hash is the console program's, as in `driver compile start` and
+            // `xcl shaders --measure-pso`; the driver-cache name is the translated DXIL's)
+            crate::xlog_warn!(
+                "D3D12.X: the driver refused the compute PSO of record {record:016x} ({} B DXIL, driver cache {}) with {hr:#x} after {} ms in the driver: its dispatches are skipped",
+                dxil.len(),
+                driver_cache::name(&dxil, d.Flags.0),
+                in_driver.as_millis()
+            );
+        }
+        note_translation_error(format!("the driver rejected the compute PSO with the translated CS ({hr:#x})"));
+        return Some(Err(()));
+    }
+    TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
+    note_pso_rs(*ppv, rs);
+    super::dred::label(*ppv as usize, &[("cs", Some(cs))]);
+    if let Some(n) = crate::gpu::recomp::pso::compute_user_sgprs(cs) {
+        PSO_USER_SGPRS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, n);
+    }
+    note_translated_compute(hr, ppv);
+    crate::xlog_info!(
+        "D3D12.X: compute PSO with the translated console CS ({} B DXIL, {} ms{})",
+        dxil.len(),
+        in_driver.as_millis(),
+        if reused { ", the driver's blob of an earlier build" } else { "" }
+    );
+    Some(Ok(hr))
+}
+
+pub(super) mod dispatch_chain;
+pub(crate) use dispatch_chain::log_counts as log_dispatch_chain_counts;
+
+/// `chained`: built with the dispatch chain's root signature (`dispatch_chain`), whose driver blobs
+/// are kept apart on disk from the same DXIL's under the title's.
+unsafe fn compute_container(this: *mut c_void, f: PsoFn, d: &D3D12_COMPUTE_PIPELINE_STATE_DESC, rs: *mut c_void,
+    dxil: &[u8], record: u64, riid: *const GUID, ppv: *mut *mut c_void, chained: bool) -> (HRESULT, std::time::Duration, bool) {
     let mut copy: D3D12_COMPUTE_PIPELINE_STATE_DESC = std::ptr::read(d);
     copy.pRootSignature = std::mem::transmute::<*mut c_void, std::mem::ManuallyDrop<Option<ID3D12RootSignature>>>(rs);
-    copy.CS = bytecode(&dxil);
+    copy.CS = bytecode(dxil);
     copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
     // A program built again gets the driver's own result of its first build: a retail title
     // made 14 big compute pipelines twice while loading, 13 - 30 s each the second time.
-    let key = compute_blob_key(&dxil, rs as usize, copy.Flags.0);
+    let key = compute_blob_key(dxil, rs as usize, copy.Flags.0);
     let mut cached = compute_blob(key);
     // … and one built in an earlier run gets the blob kept on disk then (`driver_cache`)
-    let disk = driver_cache::path(&dxil, copy.Flags.0);
+    let disk = driver_cache::path_for(dxil, copy.Flags.0, chained);
     let from_disk = cached.is_none();
     if from_disk {
         cached = disk.as_deref().and_then(driver_cache::load).map(std::sync::Arc::new);
@@ -4325,7 +4417,6 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
         copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE { pCachedBlob: b.as_ptr() as *const c_void, CachedBlobSizeInBytes: b.len() };
     }
     // in the background, a few at a time and within the commit headroom the program asks for
-    let record = crate::gpu::shader::fnv64(cs);
     let (mut hr, mut in_driver) = driver_compile_identified(
         "compute",
         dxil.len(),
@@ -4359,37 +4450,7 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
     } else if reused && from_disk {
         driver_cache::note(true, None);
     }
-    if hr < 0 {
-        // A huge program's verdict in the log itself: `note_translation_error` goes to the
-        // report, or to the notes of a cached-only attempt – a retail title's 13.8 MB program
-        // took an AMD driver 15 – 23 s and ~15 GB to refuse with E_OUTOFMEMORY in every run, and
-        // the log showed only its `driver compile finish` and the dispatches skipped after it.
-        if dxil.len() >= huge_pso_bytes() {
-            // (the record hash is the console program's, as in `driver compile start` and
-            // `xcl shaders --measure-pso`; the driver-cache name is the translated DXIL's)
-            crate::xlog_warn!(
-                "D3D12.X: the driver refused the compute PSO of record {record:016x} ({} B DXIL, driver cache {}) with {hr:#x} after {} ms in the driver: its dispatches are skipped",
-                dxil.len(),
-                driver_cache::name(&dxil, copy.Flags.0),
-                in_driver.as_millis()
-            );
-        }
-        note_translation_error(format!("the driver rejected the compute PSO with the translated CS ({hr:#x})"));
-        return Some(Err(()));
-    }
-    TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
-    note_pso_rs(*ppv, rs);
-    if let Some(n) = crate::gpu::recomp::pso::compute_user_sgprs(cs) {
-        PSO_USER_SGPRS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, n);
-    }
-    note_translated_compute(hr, ppv);
-    crate::xlog_info!(
-        "D3D12.X: compute PSO with the translated console CS ({} B DXIL, {} ms{})",
-        dxil.len(),
-        in_driver.as_millis(),
-        if reused { ", the driver's blob of an earlier build" } else { "" }
-    );
-    Some(Ok(hr))
+    (hr, in_driver, reused)
 }
 
 /// The blobs of `COMPUTE_BLOBS`, kept on disk between runs.
@@ -4414,7 +4475,14 @@ pub(crate) mod driver_cache {
 
     /// The file of the pipeline made from `dxil` with `flags`.
     pub fn name(dxil: &[u8], flags: i32) -> String {
-        format!("{:016x}-{:x}-{:x}.pso", crate::gpu::shader::fnv64(dxil), dxil.len(), flags)
+        name_for(dxil, flags, false)
+    }
+
+    /// Like [`name`], using `.chain.pso` for pipelines built with the dispatch chain's root
+    /// signature (`dispatch_chain`).
+    pub fn name_for(dxil: &[u8], flags: i32, chained: bool) -> String {
+        let ext = if chained { "chain.pso" } else { "pso" };
+        format!("{:016x}-{:x}-{:x}.{ext}", crate::gpu::shader::fnv64(dxil), dxil.len(), flags)
     }
 
     /// The file of a translated graphics pipeline keyed by its full state + shader digest.
@@ -4428,7 +4496,11 @@ pub(crate) mod driver_cache {
     }
 
     pub fn path(dxil: &[u8], flags: i32) -> Option<PathBuf> {
-        enabled().then(|| crate::gpu::recomp::dxc::cache_dir().join("driver").join(name(dxil, flags)))
+        path_for(dxil, flags, false)
+    }
+
+    pub fn path_for(dxil: &[u8], flags: i32, chained: bool) -> Option<PathBuf> {
+        enabled().then(|| crate::gpu::recomp::dxc::cache_dir().join("driver").join(name_for(dxil, flags, chained)))
     }
 
     pub fn graphics_path(hash: u64, bytes: usize) -> Option<PathBuf> {
@@ -4518,6 +4590,9 @@ pub(crate) mod driver_cache {
             assert_ne!(name(b"abc", 0), name(b"abc", 1));
             // (the length is in the name: two programs of one hash and different lengths differ)
             assert!(name(&[0u8; 0x1234], 2).ends_with("-1234-2.pso"));
+            assert_eq!(name_for(b"abc", 0, false), name(b"abc", 0));
+            assert_ne!(name_for(b"abc", 0, true), name_for(b"abc", 0, false));
+            assert!(name_for(&[0u8; 0x1234], 2, true).ends_with("-1234-2.chain.pso"));
         }
 
         #[test]
@@ -5151,6 +5226,7 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
     }
     let n = TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
     note_pso_rs(*ppv, rs);
+    super::dred::label(*ppv as usize, &[("vs", Some(vs)), ("ps", shader_bytes(&d.PS))]);
     TRANSLATED_GRAPHICS.lock().unwrap().get_or_insert_with(HashSet::new).insert(*ppv as usize);
     note_rect_list_gs(*ppv as usize, &copy, rect_gs.is_some());
     if super::present::trace_frame() {
@@ -5393,6 +5469,55 @@ unsafe fn standin_stream(this: *mut c_void, f: PsoFn, desc: *const c_void, riid:
     finish_pso(this, f, new_desc.as_ptr() as *const c_void, riid, ppv)
 }
 
+/// What the stand-in of `desc` shares its driver pipeline by (`standin::Key`): None for a desc
+/// that cannot be read. The blend, rasterizer and depth state are not in it – a stand-in draws
+/// nothing.
+unsafe fn graphics_key(this: *mut c_void, desc: *const c_void) -> Option<super::standin::Key> {
+    let d = &*(desc as *const D3D12_GRAPHICS_PIPELINE_STATE_DESC);
+    let mut state = Vec::with_capacity(64);
+    for w in [
+        d.PrimitiveTopologyType.0 as u32,
+        d.IBStripCutValue.0 as u32,
+        d.NumRenderTargets,
+        d.DSVFormat.0 as u32,
+        d.SampleDesc.Count,
+        d.SampleDesc.Quality,
+        d.NodeMask,
+        d.Flags.0 as u32,
+    ]
+    .into_iter()
+    .chain(d.RTVFormats.iter().map(|f| f.0 as u32))
+    {
+        state.extend_from_slice(&w.to_le_bytes());
+    }
+    Some(super::standin::Key { device: this as usize, root_signature: std::mem::transmute_copy::<_, usize>(&d.pRootSignature), kind: 0, state })
+}
+
+unsafe fn compute_key(this: *mut c_void, desc: *const c_void) -> Option<super::standin::Key> {
+    let d = &*(desc as *const D3D12_COMPUTE_PIPELINE_STATE_DESC);
+    let state = [d.NodeMask, d.Flags.0 as u32].iter().flat_map(|w| w.to_le_bytes()).collect();
+    Some(super::standin::Key { device: this as usize, root_signature: std::mem::transmute_copy::<_, usize>(&d.pRootSignature), kind: 1, state })
+}
+
+/// `graphics_key` of a pipeline stream: its subobjects with the stand-in's shaders in place of
+/// the title's, but the state a stand-in does not need.
+unsafe fn stream_key(this: *mut c_void, desc: *const c_void) -> Option<super::standin::Key> {
+    let (buf, _) = fallback_stream(desc as *const u8)?;
+    let (mut state, mut root_signature) = (Vec::new(), 0usize);
+    for (ty, p) in stream_subobjects(&buf)? {
+        match ty {
+            0 => root_signature = u64::from_le_bytes(p.get(..8)?.try_into().ok()?) as usize,
+            // blend, sample mask, rasterizer, depth-stencil (and its later forms), cached blob
+            8..=11 | 19 | 21 | 26..=28 => {}
+            _ => {
+                state.extend_from_slice(&ty.to_le_bytes());
+                state.extend_from_slice(p);
+            }
+        }
+    }
+    Some(super::standin::Key { device: this as usize, root_signature, kind: 2, state })
+}
+
 /// Hand the title `standin`'s result now and build the real pipeline with `build` on a worker.
 unsafe fn go_background(
     this: *mut c_void,
@@ -5403,9 +5528,29 @@ unsafe fn go_background(
     compute: bool,
     owned: OwnedDesc,
     standin: unsafe fn(*mut c_void, PsoFn, *const c_void, *const GUID, *mut *mut c_void) -> HRESULT,
+    shared_by: unsafe fn(*mut c_void, *const c_void) -> Option<super::standin::Key>,
     build: unsafe fn(Dev, &OwnedDesc, *mut *mut c_void) -> bool,
 ) -> Option<HRESULT> {
-    let hr = standin(this, f, desc, riid, ppv);
+    let key = if super::standin::enabled() && !ppv.is_null() { shared_by(this, desc) } else { None };
+    let mut driver = 0;
+    let hr = match key {
+        Some(key) => {
+            let made = super::standin::shell(key, || {
+                let mut out = std::ptr::null_mut();
+                let hr = standin(this, f, desc, &pc_iid(Kind::PipelineState), &mut out);
+                if hr < 0 || out.is_null() { Err(hr) } else { Ok(out as usize) }
+            });
+            match made {
+                Ok((shell, d)) => {
+                    *ppv = shell;
+                    driver = d;
+                    S_OK
+                }
+                Err(hr) => hr,
+            }
+        }
+        None => standin(this, f, desc, riid, ppv),
+    };
     if hr < 0 || ppv.is_null() || (*ppv).is_null() {
         static ONCE: AtomicU64 = AtomicU64::new(0);
         if ONCE.fetch_add(1, Ordering::Relaxed) < 3 {
@@ -5429,6 +5574,9 @@ unsafe fn go_background(
         super::pso_async::submit_lazy(*ppv as usize, compute, job, key);
     } else {
         super::pso_async::submit(*ppv as usize, compute, job);
+    }
+    if driver != 0 {
+        super::pso_async::shared(*ppv as usize, driver);
     }
     if image_only {
         super::pso_async::image_only(*ppv as usize);
@@ -5461,7 +5609,7 @@ unsafe fn graphics_pso(this: *mut c_void, desc: *const c_void, riid: *const GUID
     let f: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreateGraphicsPipelineState")));
     let (translated, missed) = if super::pso_async::enabled() { attempt(|| translated_graphics_pso(this, f, desc, riid, ppv)) } else { (translated_graphics_pso(this, f, desc, riid, ppv), false) };
     if missed {
-        if let Some(hr) = own_graphics(desc).and_then(|o| go_background(this, f, desc, riid, ppv, false, o, standin_graphics, build_graphics)) {
+        if let Some(hr) = own_graphics(desc).and_then(|o| go_background(this, f, desc, riid, ppv, false, o, standin_graphics, graphics_key, build_graphics)) {
             return hr;
         }
         if let Some(hr) = translated_graphics_pso(this, f, desc, riid, ppv) {
@@ -5506,7 +5654,7 @@ unsafe extern "system" fn dev_create_compute_pso(this: *mut c_void, desc: *const
     let f: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreateComputePipelineState")));
     let (mut console, missed) = if super::pso_async::enabled() { attempt(|| translated_compute_pso(this, f, desc, riid, ppv)) } else { (translated_compute_pso(this, f, desc, riid, ppv), false) };
     if missed {
-        if let Some(hr) = own_compute(desc).and_then(|o| go_background(this, f, desc, riid, ppv, true, o, standin_compute, build_compute)) {
+        if let Some(hr) = own_compute(desc).and_then(|o| go_background(this, f, desc, riid, ppv, true, o, standin_compute, compute_key, build_compute)) {
             // a console program the worker is translating (its root signature comes with it);
             // the real PSO registers itself in TRANSLATED_COMPUTE once build_compute succeeds
             // (if build_compute fails, the stand-in stays unregistered so Dispatch /
@@ -5890,6 +6038,7 @@ unsafe fn translated_mesh_stream_once(this: *mut c_void, desc: *const c_void, ri
         return None;
     }
     let ps = subs.iter().find(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS.0 as u32).and_then(|s| payload_shader(s.1));
+    let console_ps = ps;
     let (tp, (ps, ps_samplers)) = match (console_mesh(ms, ps, wave32_only(this)), two_pass_ps(ps, graphics_wave32(this))) {
         (Ok(tp), Ok(ps)) => (tp, ps),
         (Err(e), _) => {
@@ -5943,7 +6092,11 @@ unsafe fn translated_mesh_stream_once(this: *mut c_void, desc: *const c_void, ri
             out.raw(*ty, payload, palign == 8);
         }
     }
-    Some(finish_two_pass(this, &out, tp, rs, "MS", riid, ppv))
+    let hr = finish_two_pass(this, &out, tp, rs, "MS", riid, ppv);
+    if hr >= 0 {
+        super::dred::label(*ppv as usize, &[("ms", Some(ms)), ("ps", console_ps)]);
+    }
+    Some(hr)
 }
 
 /// A graphics PSO with a console VS + GS: the GS pipeline in two passes, as a mesh pipeline
@@ -6014,7 +6167,11 @@ unsafe fn translated_gs_pso(this: *mut c_void, d: &D3D12_GRAPHICS_PIPELINE_STATE
     if d.Flags.0 != 0 {
         out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_FLAGS, &d.Flags);
     }
-    finish_two_pass(this, &out, tp, rs, "GS", riid, ppv)
+    let hr = finish_two_pass(this, &out, tp, rs, "GS", riid, ppv);
+    if hr >= 0 {
+        super::dred::label(*ppv as usize, &[("vs", Some(vs)), ("gs", Some(gs)), ("ps", shader_bytes(&d.PS))]);
+    }
+    hr
 }
 
 /// Rewrite a pipeline state stream with stand-in shaders. None if not possible.
@@ -6574,7 +6731,7 @@ pub(super) unsafe extern "system" fn dev_create_pipeline_state(this: *mut c_void
     let f: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreatePipelineState")));
     let (translated, missed) = if super::pso_async::enabled() { attempt(|| translated_mesh_stream(this, desc, riid, ppv)) } else { (translated_mesh_stream(this, desc, riid, ppv), false) };
     if missed {
-        if let Some(hr) = own_stream(desc).and_then(|o| go_background(this, f, desc, riid, ppv, false, o, standin_stream, build_stream)) {
+        if let Some(hr) = own_stream(desc).and_then(|o| go_background(this, f, desc, riid, ppv, false, o, standin_stream, stream_key, build_stream)) {
             return hr;
         }
         if let Some(hr) = translated_mesh_stream(this, desc, riid, ppv) {
@@ -6711,7 +6868,7 @@ unsafe extern "system" fn cl_om_set_render_targets(this: *mut c_void, n: u32, rt
     }
 }
 
-/// A stand-in pipeline is bound as its real pipeline once that is built (compute: waited for).
+/// A stand-in pipeline is bound as its real pipeline once that is built (compute: waited for at its use).
 /// SetPipelineState on the PC list (a pipeline still building in the background: its stand-in)
 pub(super) unsafe fn bind_pipeline(this: *mut c_void, pso: *mut c_void) {
     cl_set_pipeline_state(this, pso)
@@ -6720,14 +6877,28 @@ pub(super) unsafe fn bind_pipeline(this: *mut c_void, pso: *mut c_void) {
 unsafe extern "system" fn cl_set_pipeline_state(this: *mut c_void, pso: *mut c_void) {
     type F = unsafe extern "system" fn(*mut c_void, *mut c_void);
     let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "SetPipelineState")));
-    f(this, super::pso_async::resolve_for_bind(pso as usize) as *mut c_void);
+    let bound = super::pso_async::resolve(pso as usize);
+    f(this, bound as *mut c_void);
+    super::dred::mark_pipeline(this, pso as usize, bound);
     super::list_x::on_set_pipeline_state(this, pso as usize);
+}
+
+/// The title's markers are counted for `XCL_DRED=1`'s pipeline labels (`dred`).
+unsafe extern "system" fn cl_set_marker(this: *mut c_void, metadata: u32, data: *const c_void, size: u32) {
+    type F = unsafe extern "system" fn(*mut c_void, u32, *const c_void, u32);
+    let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "SetMarker")));
+    f(this, metadata, data, size);
+    super::dred::title_marker(this);
 }
 
 unsafe extern "system" fn cl_clear_state(this: *mut c_void, pso: *mut c_void) {
     type F = unsafe extern "system" fn(*mut c_void, *mut c_void);
     let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "ClearState")));
-    f(this, super::pso_async::resolve_for_bind(pso as usize) as *mut c_void);
+    let bound = super::pso_async::resolve_for_bind(pso as usize);
+    f(this, bound as *mut c_void);
+    if !pso.is_null() {
+        super::dred::mark_pipeline(this, pso as usize, bound);
+    }
     super::list_x::on_clear_state(this, pso as usize);
     super::bind::clear_state(this, pso as usize);
 }
@@ -6768,6 +6939,7 @@ unsafe extern "system" fn cl_release(this: *mut c_void) -> u32 {
     if n == 0 {
         super::list_x::on_release(this as usize);
         super::bind::forget(this);
+        super::dred::forget_list(this);
     }
     n
 }
@@ -6785,6 +6957,7 @@ unsafe extern "system" fn alloc_release(this: *mut c_void) -> u32 {
     let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
     let n = f(this);
     if n == 0 {
+        dispatch_chain::allocator_reset(this as usize);
         super::alloc_pool::forget(this as usize);
         super::list_x::on_allocator_release(this as usize);
     }
@@ -6795,7 +6968,9 @@ unsafe extern "system" fn alloc_release(this: *mut c_void) -> u32 {
 pub(super) unsafe fn reset_pc_allocator(raw: *mut c_void) -> HRESULT {
     type F = unsafe extern "system" fn(*mut c_void) -> HRESULT;
     let f: F = std::mem::transmute(orig_fn(raw, slot_of(raw, "Reset")));
-    f(raw)
+    let hr = f(raw);
+    if hr >= 0 { dispatch_chain::allocator_reset(raw as usize); }
+    hr
 }
 
 unsafe extern "system" fn alloc_reset(this: *mut c_void) -> HRESULT {
@@ -6849,8 +7024,8 @@ static QUEUE_OLDER: AtomicBool = AtomicBool::new(false);
 
 /// command list slots of the newer layout → the older layout's slot of the same method
 /// (`DispatchMesh` sits at newer #129 after #126 RSSetShadingRate, #127 RSSetShadingRateImage,
-/// and #128 Scarlett-only shading-rate/color struct).
-const NEWER_LIST_SLOTS: [(usize, usize); 22] = [(61, 59), (62, 60), (63, 61), (64, 62), (65, 63), (70, 68), (71, 69), (72, 70), (73, 71), (74, 72), (80, 78), (83, 81), (85, 83), (86, 84), (87, 85), (90, 88), (91, 89), (92, 90), (95, 93), (96, 94), (129, 126), (139, 10)];
+/// and #128 Scarlett-only shading-rate/color struct; older #127, two slots before as the others).
+const NEWER_LIST_SLOTS: [(usize, usize); 22] = [(61, 59), (62, 60), (63, 61), (64, 62), (65, 63), (70, 68), (71, 69), (72, 70), (73, 71), (74, 72), (80, 78), (83, 81), (85, 83), (86, 84), (87, 85), (90, 88), (91, 89), (92, 90), (95, 93), (96, 94), (129, 127), (139, 10)];
 
 /// The title called device method `slot`, which only runtimes with the newer layouts have (a retail game
 /// records its first lists before any queue call could tell).
@@ -7023,8 +7198,11 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
     for &l in std::slice::from_raw_parts(lists, n as usize) {
         if let Some(pc) = super::console_list::pc_list(l) {
             mapped.push(pc);
-        } else if !super::title_list::push_segments(l, &mut mapped) {
-            mapped.push(l);
+        } else {
+            super::list_x::record_deferred(l);
+            if !super::title_list::push_segments(l, &mut mapped) {
+                mapped.push(l);
+            }
         }
     }
     super::list_x::note_queue_for_lists(this as usize, &mapped);
@@ -7173,7 +7351,16 @@ pub fn log_device_removed() {
             report_dred_lists(bc.pHeadAutoBreadcrumbNode, |node, done| {
                 let count = node.BreadcrumbCount as usize;
                 let ops: Vec<String> = (done.saturating_sub(3)..(done + 3).min(count)).map(|i| format!("{}{}", if i == done { ">" } else { "" }, (*node.pCommandHistory.add(i)).0)).collect();
-                crate::xlog_error!("DRED: list {:p} on queue {:p}: {done} of {count} operations done, around: {}", node.pCommandList.as_ref().map_or(std::ptr::null_mut(), |l| l.as_raw()), node.pCommandQueue.as_ref().map_or(std::ptr::null_mut(), |q| q.as_raw()), ops.join(" "));
+                let list = node.pCommandList.as_ref().map_or(std::ptr::null_mut(), |l| l.as_raw());
+                let history: Vec<i32> = if node.pCommandHistory.is_null() { Vec::new() } else { std::slice::from_raw_parts(node.pCommandHistory, count).iter().map(|o| o.0).collect() };
+                let name = if node.pCommandListDebugNameW.is_null() { None } else { node.pCommandListDebugNameW.to_string().ok() };
+                let key = super::dred::node_list(list as usize, name.as_deref());
+                let mut bound = super::dred::bound_at(key, &history, done).map(|l| format!("; pipeline bound there: {l}")).unwrap_or_default();
+                let after = super::dred::bound_after(key, &history, done);
+                if !after.is_empty() {
+                    bound += &format!("; bound after it: {}", after.iter().take(4).cloned().collect::<Vec<_>>().join(", "));
+                }
+                crate::xlog_error!("DRED: list {:p} on queue {:p}: {done} of {count} operations done, around: {}{bound}", list, node.pCommandQueue.as_ref().map_or(std::ptr::null_mut(), |q| q.as_raw()), ops.join(" "));
             });
         }
     }
@@ -7461,7 +7648,16 @@ mod readback_routing_tests {
                     drop(r_ok);
                     drop(heap);
                 }
-                assert_ne!(VirtualFree(mem, 0, MEM_RELEASE), 0);
+                // D3D12CreateDevice gives the process's one device: once another test adopted it,
+                // r_ok was adopted too, and its last Release is held (`late_release`) while a
+                // queue of another test still has work. The heap pins `mem` until then (#1487).
+                let start = std::time::Instant::now();
+                let mut freed = VirtualFree(mem, 0, MEM_RELEASE);
+                while freed == 0 && start.elapsed() < std::time::Duration::from_secs(10) {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    freed = VirtualFree(mem, 0, MEM_RELEASE);
+                }
+                assert_ne!(freed, 0, "the heap's pages were not let go within 10 s");
             }
         }
     }
@@ -7546,6 +7742,16 @@ mod readback_routing_tests {
         }
     }
 
+    /// Console #53 / #54 ClearUnorderedAccessViewUint / Float translate their console handles
+    /// (not the PC #49 / #50 the remap alone gives).
+    #[test]
+    fn console_clear_uav_slots_translate_handles() {
+        use super::super::list_x as l;
+        let slots = console_slots(Kind::CommandList);
+        assert!(slots.contains(&(53, l::clear_uav_uint_x as usize)));
+        assert!(slots.contains(&(54, l::clear_uav_float_x as usize)));
+    }
+
     /// Bug #6: `Kind::DmaList` must install `cl_release` so releasing a DMA command list removes
     /// its entry from `list_x::LISTS`.
     #[test]
@@ -7586,6 +7792,8 @@ mod readback_routing_tests {
 #[cfg(test)]
 mod queue_tests {
     use super::*;
+    use std::mem::{offset_of, size_of};
+    use windows::Win32::Graphics::Direct3D12::ID3D12Fence_Vtbl;
 
     // a fake adopted queue: the extension vtable's word before slot 0 points at the PC table
     unsafe extern "system" fn get_desc(_: *mut c_void, out: usize) -> usize {
@@ -7596,11 +7804,36 @@ mod queue_tests {
     unsafe extern "system" fn signal(_: *mut c_void, _: usize, _: usize) -> i32 {
         0
     }
+    unsafe extern "system" fn fake_fence_completed(_: *mut c_void) -> u64 {
+        u64::MAX
+    }
+
+    #[repr(C)]
+    struct FakeFence {
+        vtable: *const usize,
+    }
+
+    /// Removes the synthetic fence and queue entries from every global table that
+    /// `queue_dispatch(14, ...)` touches before the stack objects go out of scope.
+    struct Cleanup {
+        fence: usize,
+        queue: usize,
+    }
+
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            FENCES.write().unwrap_or_else(|e| e.into_inner()).retain(|&f| f != self.fence);
+            super::super::fence_x::forget_fence_for_test(self.fence);
+            super::super::list_x::forget_title_fence_for_test(self.fence, self.queue);
+            QUEUE_OLDER.store(false, Ordering::Release);
+        }
+    }
 
     /// Queue #18 before the layout is known writes 8 bytes; after a Signal at #14 (the older
     /// layout) it is GetDesc with all 16.
     #[test]
     fn queue_slot_18_before_the_layout_is_known_writes_8_bytes() {
+        const SLOT: usize = size_of::<usize>();
         let mut pc = [0usize; 32];
         pc[14] = signal as usize;
         pc[18] = get_desc as usize;
@@ -7608,7 +7841,14 @@ mod queue_tests {
         let vtbl = ext.as_ptr() as usize + 8;
         let mut obj = [vtbl];
         let this = obj.as_mut_ptr() as *mut c_void;
-        let fence = 0x5EED_0000usize;
+        // A valid minimal ID3D12Fence COM object while registered: if a parallel test inspects
+        // `SYNC_GRAPH.title_fences` before `Cleanup::drop` runs, `GetCompletedValue` succeeds
+        // cleanly instead of dereferencing an unmapped sentinel address.
+        let mut fence_vtbl = [0usize; size_of::<ID3D12Fence_Vtbl>() / SLOT];
+        fence_vtbl[offset_of!(ID3D12Fence_Vtbl, GetCompletedValue) / SLOT] = fake_fence_completed as usize;
+        let fake_fence = FakeFence { vtable: fence_vtbl.as_ptr() };
+        let fence = (&fake_fence as *const FakeFence) as usize;
+        let _cleanup = Cleanup { fence, queue: this as usize };
         QUEUE_SHIFTED.store(false, Ordering::Release);
         QUEUE_OLDER.store(false, Ordering::Release);
         unsafe {
@@ -7618,18 +7858,16 @@ mod queue_tests {
             assert_eq!(out, [1, 2, 0xAAAA_AAAA, 0xAAAA_AAAA], "only the first 8 bytes");
             FENCES.write().unwrap().push(fence);
             queue_dispatch(14, this, fence, 1, 0, 0);
-            FENCES.write().unwrap().retain(|&f| f != fence);
             assert!(QUEUE_OLDER.load(Ordering::Acquire) && !QUEUE_SHIFTED.load(Ordering::Acquire));
             let mut out = [0xAAAA_AAAAu32; 4];
             queue_dispatch(18, this, out.as_mut_ptr() as usize, 0, 0, 0);
             assert_eq!(out, [1, 2, 3, 4], "older layout: the whole description");
         }
-        QUEUE_OLDER.store(false, Ordering::Release);
     }
 
     #[test]
     fn newer_layout_maps_dispatch_mesh_to_slot_129_not_128() {
-        assert!(NEWER_LIST_SLOTS.contains(&(129, 126)), "DispatchMesh must map to newer slot #129");
+        assert!(NEWER_LIST_SLOTS.contains(&(129, 127)), "DispatchMesh must map to newer slot #129");
         assert!(!NEWER_LIST_SLOTS.iter().any(|&(newer, _)| newer == 128), "newer slot #128 must not map to DispatchMesh");
     }
 }

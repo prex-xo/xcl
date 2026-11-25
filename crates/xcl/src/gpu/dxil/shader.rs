@@ -160,6 +160,20 @@ pub struct RawUav {
 }
 
 impl Shader {
+    pub(super) fn dispatch_piece(&self) -> Self {
+        Self {
+            m: self.m.declarations(),
+            stage: self.stage,
+            sm: self.sm,
+            entry: self.entry,
+            features: self.features.clone(),
+            bindings: self.bindings.clone(),
+            handle_ty: self.handle_ty,
+            props_ty: self.props_ty,
+            rov: self.rov,
+        }
+    }
+
     pub fn new(stage: Stage, sm: (u32, u32)) -> Shader {
         let mut m = Module::new();
         let entry = m.define_entry("main");
@@ -519,6 +533,10 @@ impl Shader {
             self.m.ret();
         }
         self.m.optimize();
+        self.finish_optimized(numthreads, wave_size)
+    }
+
+    pub(super) fn finish_optimized(mut self, numthreads: [u32; 3], wave_size: Option<u32>) -> Result<Vec<u8>, String> {
         self.infer_type_features();
         let (flags, sfi0) = self.feature_flags();
 
@@ -646,6 +664,7 @@ pub fn dxc_fn_attrs(op: u32) -> Option<FnAttrs> {
         137 | 138 => ReadNone,                 // attributeAtVertex, viewID
         139 => ReadOnly,                       // rawBufferLoad
         140 => NoUnwind,                       // rawBufferStore
+        164 => ReadNone,                       // dot4AddU8Packed
         165..=169 => NoUnwind,                 // waveMatch, waveMultiPrefix*, mesh outputs
         170 => ReadOnly,                       // getMeshPayload
         171 | 172 => NoUnwind,                 // storeVertexOutput, storePrimitiveOutput
