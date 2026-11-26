@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use crate::config::{Boot, Config};
 use crate::util::wide;
 
+
 /// Data root: `%XCL_DATA_ROOT%` or `%LOCALAPPDATA%\XCL`.
 pub fn data_root() -> PathBuf {
     if let Ok(p) = std::env::var("XCL_DATA_ROOT") {
@@ -286,6 +287,14 @@ fn quote(a: &str) -> String {
 }
 
 pub fn run(target: &Path, args: &[String]) -> i32 {
+    run_with_ui(target, args, false)
+}
+
+pub fn run_from_menu(target: &Path) -> i32 {
+    run_with_ui(target, &[], true)
+}
+
+fn run_with_ui(target: &Path, args: &[String], menu: bool) -> i32 {
     let (root, explicit_exe, title) = match resolve_location(target) {
         Ok(x) => x,
         Err(e) => {
@@ -388,7 +397,7 @@ pub fn run(target: &Path, args: &[String]) -> i32 {
         cmdline.push(' ');
         cmdline.push_str(&quote(a));
     }
-    let code = match spawn_host(&cmdline, &root, &boot_path) {
+    let code = match spawn_host(&cmdline, &root, &boot_path, menu) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("xcl: failed to start the game process: {e}");
@@ -448,12 +457,20 @@ pub fn missing_console_cpu_features() -> Vec<&'static str> {
     })
 }
 
-fn spawn_host(cmdline: &str, cwd: &Path, boot_path: &Path) -> Result<u32, String> {
+fn spawn_host(cmdline: &str, cwd: &Path, boot_path: &Path, menu: bool) -> Result<u32, String> {
     use windows_sys::Win32::Foundation::{CloseHandle, GetLastError};
     use windows_sys::Win32::System::Threading::{
         CreateProcessW, GetExitCodeProcess, WaitForSingleObject, INFINITE, PROCESS_INFORMATION, STARTUPINFOW,
     };
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use windows_sys::Win32::System::Threading::{GetCurrentProcessId, OpenProcess, PROCESS_SYNCHRONIZE};
     let me = std::env::current_exe().map_err(|e| e.to_string())?;
+    // An inheritable, synchronize-only handle identifies this exact launcher even after PID reuse.
+    let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 1, GetCurrentProcessId()) };
+    if handle.is_null() { return Err(std::io::Error::last_os_error().to_string()); }
+    let parent = unsafe { OwnedHandle::from_raw_handle(handle) };
+    std::env::set_var("XCL_PREPARATION_PARENT", (parent.as_raw_handle() as usize).to_string());
+    if menu { std::env::set_var("XCL_PREPARATION_MENU", "1"); }
     std::env::set_var("XCL_HOST", boot_path);
     let app = wide(&me.to_string_lossy());
     let mut cmd = wide(cmdline);
@@ -474,9 +491,12 @@ fn spawn_host(cmdline: &str, cwd: &Path, boot_path: &Path) -> Result<u32, String
             &si,
             &mut pi,
         );
+        let error = GetLastError();
         std::env::remove_var("XCL_HOST");
+        std::env::remove_var("XCL_PREPARATION_PARENT");
+        std::env::remove_var("XCL_PREPARATION_MENU");
         if ok == 0 {
-            return Err(format!("CreateProcessW: error {}", GetLastError()));
+            return Err(format!("CreateProcessW: error {error}"));
         }
         WaitForSingleObject(pi.hProcess, INFINITE);
         let mut code = 0u32;
