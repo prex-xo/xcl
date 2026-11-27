@@ -63,6 +63,33 @@ fn run_shaders(target: &Path, extra: &[&str]) -> Output {
 }
 
 #[test]
+fn pso_precompile_help_and_required_records_operand() {
+    let help = Command::new(env!("CARGO_BIN_EXE_xcl"))
+        .args(["pso-precompile", "--help"])
+        .output()
+        .expect("spawn xcl pso-precompile --help");
+    assert!(help.status.success(), "{help:?}");
+    assert!(String::from_utf8_lossy(&help.stdout).contains("Usage: xcl pso-precompile"), "{help:?}");
+
+    let dir = TempDir::new("pso-records-operand");
+    let pack = dir.path().join("shaders.rpf");
+    let mut bytes = b"9FPR".to_vec();
+    bytes.resize(0x40, 0);
+    std::fs::write(&pack, bytes).unwrap();
+
+    for tail in [&["--records"][..], &["--records", "--used"][..]] {
+        let output = Command::new(env!("CARGO_BIN_EXE_xcl"))
+            .arg("pso-precompile")
+            .arg(&pack)
+            .args(tail)
+            .output()
+            .expect("spawn xcl pso-precompile");
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        assert!(String::from_utf8_lossy(&output.stderr).contains("--records needs a value"), "{output:?}");
+    }
+}
+
+#[test]
 fn help_lists_shader_precompile_options() {
     let out = Command::new(env!("CARGO_BIN_EXE_xcl")).arg("--help").output().unwrap();
     assert!(out.status.success(), "{out:?}");
